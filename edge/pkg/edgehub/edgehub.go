@@ -1,6 +1,7 @@
 package edgehub
 
 import (
+	"net"
 	"sync"
 	"time"
 
@@ -14,18 +15,20 @@ import (
 	"github.com/kubeedge/kubeedge/edge/pkg/edgehub/certificate"
 	"github.com/kubeedge/kubeedge/edge/pkg/edgehub/clients"
 	"github.com/kubeedge/kubeedge/edge/pkg/edgehub/config"
+
 	// register Task handler
 	_ "github.com/kubeedge/kubeedge/edge/pkg/edgehub/task"
 )
 
 // EdgeHub defines edgehub object structure
 type EdgeHub struct {
-	certManager   certificate.CertManager
-	chClient      clients.Adapter
-	reconnectChan chan struct{}
-	rateLimiter   flowcontrol.RateLimiter
-	keeperLock    sync.RWMutex
-	enable        bool
+	certManager       certificate.CertManager
+	chClient          clients.Adapter
+	reconnectChan     chan struct{}
+	rateLimiter       flowcontrol.RateLimiter
+	keeperLock        sync.RWMutex
+	enable            bool
+	networkInterfaces map[string]string
 }
 
 var _ core.Module = (*EdgeHub)(nil)
@@ -85,6 +88,11 @@ func (eh *EdgeHub) Start() {
 
 	go eh.ifRotationDone()
 
+	eh.networkInterfaces = make(map[string]string)
+	eh.updateNetworkInterfaces()
+
+	go eh.monitorNetworkChanges()
+
 	for {
 		select {
 		case <-beehiveContext.Done():
@@ -134,4 +142,118 @@ func (eh *EdgeHub) Start() {
 			}
 		}
 	}
+}
+
+func (eh *EdgeHub) updateNetworkInterfaces() {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		klog.Errorf("Failed to get network interfaces: %v", err)
+		return
+	}
+
+	newInterfaces := make(map[string]string)
+
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			klog.Errorf("Failed to get addresses for interface %s: %v", iface.Name, err)
+			continue
+		}
+
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok || ipNet.IP.IsLoopback() || ipNet.IP.To4() == nil {
+				continue
+			}
+
+			newInterfaces[iface.Name] = ipNet.IP.String()
+			break
+		}
+	}
+
+	eh.keeperLock.Lock()
+	eh.networkInterfaces = newInterfaces
+	eh.keeperLock.Unlock()
+}
+
+func (eh *EdgeHub) monitorNetworkChanges() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-beehiveContext.Done():
+			klog.Warning("Network monitor stopping")
+			return
+		case <-ticker.C:
+			changed := eh.checkNetworkChanges()
+			if changed {
+				klog.Infof("Network change detected, triggering reconnection")
+				eh.reconnectChan <- struct{}{}
+			}
+		}
+	}
+}
+
+func (eh *EdgeHub) checkNetworkChanges() bool {
+	eh.keeperLock.RLock()
+	oldInterfaces := make(map[string]string)
+	for k, v := range eh.networkInterfaces {
+		oldInterfaces[k] = v
+	}
+	eh.keeperLock.RUnlock()
+
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		klog.Errorf("Failed to get network interfaces: %v", err)
+		return false
+	}
+
+	changed := false
+	newInterfaces := make(map[string]string)
+
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			klog.Errorf("Failed to get addresses for interface %s: %v", iface.Name, err)
+			continue
+		}
+
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok || ipNet.IP.IsLoopback() || ipNet.IP.To4() == nil {
+				continue
+			}
+
+			newIP := ipNet.IP.String()
+			newInterfaces[iface.Name] = newIP
+
+			if oldIP, exists := oldInterfaces[iface.Name]; exists && oldIP != newIP {
+				klog.Infof("IP address changed for interface %s: %s -> %s", iface.Name, oldIP, newIP)
+				changed = true
+			}
+
+			break
+		}
+	}
+
+	if len(oldInterfaces) != len(newInterfaces) {
+		changed = true
+	}
+
+	if changed {
+		eh.keeperLock.Lock()
+		eh.networkInterfaces = newInterfaces
+		eh.keeperLock.Unlock()
+	}
+
+	return changed
 }
