@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package dtmodule_test
+package dtmodule
 
 import (
 	"fmt"
@@ -24,13 +24,12 @@ import (
 
 	"github.com/kubeedge/kubeedge/edge/pkg/devicetwin/dtcommon"
 	"github.com/kubeedge/kubeedge/edge/pkg/devicetwin/dtcontext"
-	. "github.com/kubeedge/kubeedge/edge/pkg/devicetwin/dtmanager"
-	. "github.com/kubeedge/kubeedge/edge/pkg/devicetwin/dtmodule"
+	"github.com/kubeedge/kubeedge/edge/pkg/devicetwin/dtmanager"
 )
 
 // mockPanicWorker implements a worker that panics for testing
 type mockPanicWorker struct {
-	Worker
+	dtmanager.Worker
 }
 
 func (w mockPanicWorker) Start() {
@@ -49,7 +48,7 @@ func TestDTModule_InitWorker_DMIModule(t *testing.T) {
 	}
 	dm.InitWorker(recvCh, confirmCh, heartBeatCh, ctx)
 
-	dmiWorker, ok := dm.Worker.(DMIWorker)
+	dmiWorker, ok := dm.Worker.(dtmanager.DMIWorker)
 	if !ok {
 		t.Errorf("Expected worker type DMIWorker, got %T", dm.Worker)
 	}
@@ -85,7 +84,7 @@ func TestDTModule_Start_PanicRecovery(t *testing.T) {
 	dm := &DTModule{
 		Name: "TestModule",
 		Worker: mockPanicWorker{
-			Worker: Worker{
+			Worker: dtmanager.Worker{
 				ReceiverChan:  recvCh,
 				ConfirmChan:   confirmCh,
 				HeartBeatChan: heartBeatCh,
@@ -211,15 +210,15 @@ func TestDTModule_InitWorker(t *testing.T) {
 	tests := []struct {
 		name   string
 		fields fields
-		want   DTWorker
+		want   dtmanager.DTWorker
 	}{
 		{
 			name: dtcommon.MemModule,
 			fields: fields{
 				Name: dtcommon.MemModule,
 			},
-			want: MemWorker{
-				Worker: Worker{
+			want: dtmanager.MemWorker{
+				Worker: dtmanager.Worker{
 					ReceiverChan:  recvCh,
 					ConfirmChan:   confirmCh,
 					HeartBeatChan: heartBearCh,
@@ -233,8 +232,8 @@ func TestDTModule_InitWorker(t *testing.T) {
 			fields: fields{
 				Name: dtcommon.TwinModule,
 			},
-			want: TwinWorker{
-				Worker: Worker{
+			want: dtmanager.TwinWorker{
+				Worker: dtmanager.Worker{
 					ReceiverChan:  recvCh,
 					ConfirmChan:   confirmCh,
 					HeartBeatChan: heartBearCh,
@@ -248,8 +247,8 @@ func TestDTModule_InitWorker(t *testing.T) {
 			fields: fields{
 				Name: dtcommon.DeviceModule,
 			},
-			want: DeviceWorker{
-				Worker: Worker{
+			want: dtmanager.DeviceWorker{
+				Worker: dtmanager.Worker{
 					ReceiverChan:  recvCh,
 					ConfirmChan:   confirmCh,
 					HeartBeatChan: heartBearCh,
@@ -263,8 +262,8 @@ func TestDTModule_InitWorker(t *testing.T) {
 			fields: fields{
 				Name: dtcommon.CommModule,
 			},
-			want: CommWorker{
-				Worker: Worker{
+			want: dtmanager.CommWorker{
+				Worker: dtmanager.Worker{
 					ReceiverChan:  recvCh,
 					ConfirmChan:   confirmCh,
 					HeartBeatChan: heartBearCh,
