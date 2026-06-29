@@ -1,9 +1,11 @@
 package edgehub
 
 import (
+	"math"
 	"sync"
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/flowcontrol"
 	"k8s.io/klog/v2"
 
@@ -17,6 +19,23 @@ import (
 	msghandler "github.com/kubeedge/kubeedge/edge/pkg/edgehub/messagehandler"
 	"github.com/kubeedge/kubeedge/pkg/features"
 )
+
+// reconnectBackoff returns the backoff used between reconnect attempts.
+// It starts small and grows exponentially with jitter, capped at 30s, so
+// that a quickly-recovered network surfaces a NotReady node back to Ready
+// within seconds instead of waiting heartbeat*2 (up to 4 minutes when
+// heartbeat is configured to 120s).
+func reconnectBackoff() wait.Backoff {
+	return wait.Backoff{
+		Duration: 2 * time.Second,
+		Factor:   2.0,
+		Jitter:   0.2,
+		Cap:      30 * time.Second,
+		// Steps is effectively unbounded; once Cap is reached, Step()
+		// keeps returning Cap*(1+jitter). We never want to stop retrying.
+		Steps: math.MaxInt32,
+	}
+}
 
 // EdgeHub defines edgehub object structure
 type EdgeHub struct {
@@ -45,11 +64,25 @@ func NewCertSyncChannel() map[string]chan bool {
 func newEdgeHub(enable bool) *EdgeHub {
 	NewCertSyncChannel()
 	return &EdgeHub{
-		enable:        enable,
-		reconnectChan: make(chan struct{}),
+		enable: enable,
+		// Buffered(1) so that any sender can deliver a reconnect signal
+		// without blocking when one is already pending. Multiple senders
+		// (routeToEdge / routeToCloud / keepalive / ifRotationDone) all
+		// converge on this channel; coalescing them is intentional.
+		reconnectChan: make(chan struct{}, 1),
 		rateLimiter: flowcontrol.NewTokenBucketRateLimiter(
 			float32(config.Config.EdgeHub.MessageQPS),
 			int(config.Config.EdgeHub.MessageBurst)),
+	}
+}
+
+// triggerReconnect requests a reconnect without blocking. If a reconnect
+// signal is already pending, the call is a no-op since one signal is
+// sufficient to drive the reconnect loop.
+func (eh *EdgeHub) triggerReconnect() {
+	select {
+	case eh.reconnectChan <- struct{}{}:
+	default:
 	}
 }
 
@@ -99,6 +132,7 @@ func (eh *EdgeHub) Start() {
 
 	go eh.ifRotationDone()
 
+	backoff := reconnectBackoff()
 	for {
 		select {
 		case <-beehiveContext.Done():
@@ -112,14 +146,25 @@ func (eh *EdgeHub) Start() {
 			return
 		}
 
-		waitTime := time.Duration(config.Config.Heartbeat) * time.Second * 2
-
 		err = eh.chClient.Init()
 		if err != nil {
-			klog.Errorf("connection failed: %v, will reconnect after %s", err, waitTime.String())
-			time.Sleep(waitTime)
+			sleep := backoff.Step()
+			klog.Errorf("connection failed: %v, will reconnect after %s", err, sleep.String())
+			time.Sleep(sleep)
 			continue
 		}
+		// Drain any reconnect signal queued by other goroutines (e.g.
+		// ifRotationDone firing during the Init above). Without this, the
+		// stale signal would be received immediately by <-reconnectChan
+		// below, triggering an unnecessary reconnect cycle right after a
+		// successful connect.
+		select {
+		case <-eh.reconnectChan:
+		default:
+		}
+		// connection established; reset backoff so a transient failure does
+		// not penalize the next outage.
+		backoff = reconnectBackoff()
 		// execute hook func after connect
 		eh.pubConnectInfo(true)
 		go eh.routeToEdge()
@@ -134,18 +179,16 @@ func (eh *EdgeHub) Start() {
 		// execute hook fun after disconnect
 		eh.pubConnectInfo(false)
 
-		// sleep one period of heartbeat, then try to connect cloud hub again
-		klog.Warningf("connection is broken, will reconnect after %s", waitTime.String())
-		time.Sleep(waitTime)
+		sleep := backoff.Step()
+		klog.Warningf("connection is broken, will reconnect after %s", sleep.String())
+		time.Sleep(sleep)
 
-		// clean channel
-	clean:
-		for {
-			select {
-			case <-eh.reconnectChan:
-			default:
-				break clean
-			}
+		// reconnectChan is buffered(1) and triggerReconnect is non-blocking,
+		// so at most one queued signal can remain. A single non-blocking
+		// receive is sufficient to start the next cycle from a clean state.
+		select {
+		case <-eh.reconnectChan:
+		default:
 		}
 	}
 }

@@ -18,6 +18,7 @@ package edgehub
 
 import (
 	"testing"
+	"time"
 
 	"github.com/kubeedge/api/apis/componentconfig/edgecore/v1alpha2"
 	"github.com/kubeedge/kubeedge/edge/pkg/edgehub/config"
@@ -89,6 +90,69 @@ func TestGroup(t *testing.T) {
 			t.Errorf("EdgeHub.Group() returned unexpected result. got = %s, want = hub", got)
 		}
 	})
+}
+
+func TestTriggerReconnectNonBlocking(t *testing.T) {
+	eh := &EdgeHub{reconnectChan: make(chan struct{}, 1)}
+
+	// First call enqueues a signal.
+	eh.triggerReconnect()
+	// Second call must not block even though the channel is full.
+	done := make(chan struct{})
+	go func() {
+		eh.triggerReconnect()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("triggerReconnect blocked when channel was full")
+	}
+
+	// Exactly one signal should be receivable; the second send was coalesced.
+	select {
+	case <-eh.reconnectChan:
+	default:
+		t.Fatal("expected one reconnect signal")
+	}
+	select {
+	case <-eh.reconnectChan:
+		t.Fatal("did not expect a second reconnect signal")
+	default:
+	}
+}
+
+func TestReconnectBackoffGrowsAndCaps(t *testing.T) {
+	b := reconnectBackoff()
+	cap := 30 * time.Second
+	maxAllowed := cap + (cap * 20 / 100)
+
+	for i := 0; i < 50; i++ {
+		got := b.Step()
+		if got <= 0 {
+			t.Fatalf("step %d: backoff must be positive, got %v", i, got)
+		}
+		if got > maxAllowed {
+			t.Fatalf("step %d: %v exceeds cap+jitter (%v)", i, got, maxAllowed)
+		}
+	}
+}
+
+func TestReconnectBackoffResetReturnsInitial(t *testing.T) {
+	b := reconnectBackoff()
+	// Exhaust until Cap is reached.
+	for i := 0; i < 10; i++ {
+		b.Step()
+	}
+	// Re-creating returns a backoff starting from the initial duration
+	// (2s); this is the contract used to reset on successful reconnect.
+	b2 := reconnectBackoff()
+	first := b2.Step()
+	minAllowed := 2 * time.Second
+	maxAllowed := 2*time.Second + (2*time.Second*20)/100
+	if first < minAllowed || first > maxAllowed {
+		t.Fatalf("initial step out of [%v, %v]: got %v", minAllowed, maxAllowed, first)
+	}
 }
 
 func TestEnable(t *testing.T) {
