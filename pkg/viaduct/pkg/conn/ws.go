@@ -20,30 +20,32 @@ import (
 )
 
 type WSConnection struct {
-	WriteDeadline      time.Time
-	ReadDeadline       time.Time
-	handler            mux.Handler
-	wsConn             *websocket.Conn
-	state              *ConnectionState
-	syncKeeper         *keeper.SyncKeeper
-	connUse            api.UseType
-	consumer           io.Writer
-	autoRoute          bool
-	messageFifo        *fifo.MessageFifo
-	locker             sync.Mutex
-	OnReadTransportErr func(nodeID, projectID string)
+	WriteDeadline        time.Time
+	ReadDeadline         time.Time
+	handler              mux.Handler
+	wsConn               *websocket.Conn
+	state                *ConnectionState
+	syncKeeper           *keeper.SyncKeeper
+	connUse              api.UseType
+	consumer             io.Writer
+	autoRoute            bool
+	messageFifo          *fifo.MessageFifo
+	locker               sync.Mutex
+	OnReadTransportErr   func(nodeID, projectID string)
+	readDeadlineInterval time.Duration
 }
 
 func NewWSConn(options *ConnectionOptions) *WSConnection {
 	return &WSConnection{
-		wsConn:             options.Base.(*websocket.Conn),
-		handler:            options.Handler,
-		syncKeeper:         keeper.NewSyncKeeper(),
-		state:              options.State,
-		connUse:            options.ConnUse,
-		autoRoute:          options.AutoRoute,
-		messageFifo:        fifo.NewMessageFifo(),
-		OnReadTransportErr: options.OnReadTransportErr,
+		wsConn:               options.Base.(*websocket.Conn),
+		handler:              options.Handler,
+		syncKeeper:           keeper.NewSyncKeeper(),
+		state:                options.State,
+		connUse:              options.ConnUse,
+		autoRoute:            options.AutoRoute,
+		messageFifo:          fifo.NewMessageFifo(),
+		OnReadTransportErr:   options.OnReadTransportErr,
+		readDeadlineInterval: options.ReadDeadlineInterval,
 	}
 }
 
@@ -101,14 +103,35 @@ func (conn *WSConnection) handleRawData() {
 
 func (conn *WSConnection) handleMessage() {
 	for {
+		// Apply a per-iteration read deadline so a half-open TCP connection
+		// surfaces as a read error within readDeadlineInterval instead of
+		// waiting for kernel TCP retransmission (tcp_retries2, ~15min on Linux).
+		if conn.readDeadlineInterval > 0 {
+			_ = conn.wsConn.SetReadDeadline(time.Now().Add(conn.readDeadlineInterval))
+		}
 		msg := &model.Message{}
 		err := lane.NewLane(api.ProtocolTypeWS, conn.wsConn).ReadMessage(msg)
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
+			// A read deadline expiry is the expected reconnect path when
+			// readDeadlineInterval is set, so log it at a low verbosity to
+			// avoid spamming Errorf on every (60s by default) reconnect cycle.
+			// Genuine transport errors still surface as Errorf.
+			var netErr net.Error
+			switch {
+			case errors.Is(err, io.EOF):
+				// silent: legacy behavior
+			case errors.As(err, &netErr) && netErr.Timeout():
+				klog.V(2).Infof("read deadline reached, will reconnect: %v", err)
+			default:
 				klog.Errorf("failed to read message, error: %+v", err)
 			}
 			conn.state.State = api.StatDisconnected
 			_ = conn.wsConn.Close()
+			// Close the FIFO so that callers blocked on ReadMessage()/Get()
+			// (e.g. EdgeHub's routeToEdge) observe the error immediately and
+			// can trigger a reconnect, instead of waiting for the next
+			// keepalive write to fail (up to one Heartbeat period).
+			conn.messageFifo.Close()
 
 			if conn.OnReadTransportErr != nil {
 				conn.OnReadTransportErr(conn.state.Headers.Get("node_id"),
@@ -151,12 +174,12 @@ func (conn *WSConnection) handleMessage() {
 
 func (conn *WSConnection) SetReadDeadline(t time.Time) error {
 	conn.ReadDeadline = t
-	return nil
+	return conn.wsConn.SetReadDeadline(t)
 }
 
 func (conn *WSConnection) SetWriteDeadline(t time.Time) error {
 	conn.WriteDeadline = t
-	return nil
+	return conn.wsConn.SetWriteDeadline(t)
 }
 
 func (conn *WSConnection) Read(raw []byte) (int, error) {
