@@ -122,6 +122,59 @@ func TestTriggerReconnectNonBlocking(t *testing.T) {
 	}
 }
 
+// TestDrainReconnectLeavesRotateSignal guards the certificate-rotation
+// guarantee: the post-connect drain must only discard stale transport
+// reconnect signals, never a pending rotation signal. Dropping the latter
+// would leave a connection running on a stale certificate until the next
+// natural disconnect (certManager.Done fires only once per rotation).
+func TestDrainReconnectLeavesRotateSignal(t *testing.T) {
+	eh := &EdgeHub{
+		reconnectChan: make(chan struct{}, 1),
+		rotateChan:    make(chan struct{}, 1),
+	}
+	eh.triggerReconnect()
+	eh.rotateChan <- struct{}{}
+
+	eh.drainReconnect()
+
+	select {
+	case <-eh.reconnectChan:
+		t.Fatal("drainReconnect must discard the pending reconnect signal")
+	default:
+	}
+	select {
+	case <-eh.rotateChan:
+	default:
+		t.Fatal("drainReconnect must not consume a pending rotation signal")
+	}
+
+	// Draining with nothing pending must not block.
+	done := make(chan struct{})
+	go func() {
+		eh.drainReconnect()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("drainReconnect blocked on an empty channel")
+	}
+}
+
+// TestShouldResetBackoff guards the flapping protection: the backoff is only
+// reset once a connection survived longer than the backoff cap, so a
+// connect-then-die loop keeps backing off instead of retrying at the initial
+// interval forever.
+func TestShouldResetBackoff(t *testing.T) {
+	b := reconnectBackoff()
+	if shouldResetBackoff(time.Now().Add(-time.Second), b) {
+		t.Fatal("a connection that lived 1s must not reset the backoff")
+	}
+	if !shouldResetBackoff(time.Now().Add(-b.Cap-time.Second), b) {
+		t.Fatal("a connection that outlived the cap must reset the backoff")
+	}
+}
+
 func TestReconnectBackoffGrowsAndCaps(t *testing.T) {
 	b := reconnectBackoff()
 	cap := 30 * time.Second

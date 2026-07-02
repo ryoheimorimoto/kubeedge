@@ -150,7 +150,16 @@ func (eh *EdgeHub) ifRotationDone() {
 	if eh.certManager.RotateCertificates {
 		for {
 			<-eh.certManager.Done
-			eh.triggerReconnect()
+			// Send on the dedicated rotation channel so the signal cannot
+			// be coalesced away with transport reconnects (rotateChan is
+			// never drained; see Start). Buffered(1) + non-blocking keeps
+			// this loop from blocking when a signal is already pending —
+			// one pending rotation reconnect is enough, the newest
+			// certificate is always read from disk.
+			select {
+			case eh.rotateChan <- struct{}{}:
+			default:
+			}
 		}
 	}
 }
