@@ -25,11 +25,15 @@ import (
 	"github.com/kubeedge/kubeedge/pkg/viaduct/pkg/keeper"
 )
 
-// newTestWSConn spins up a server-side websocket that does nothing and
-// connects a client to it. The returned WSConnection is configured with the
-// supplied read deadline interval; the caller must close srv to release the
-// goroutine.
-func newTestWSConn(t *testing.T, readDeadlineInterval time.Duration) (*WSConnection, *httptest.Server) {
+// newTestWSConn spins up a server-side websocket and connects a client to
+// it. With serverReads=true the server runs a normal read loop, which makes
+// gorilla answer the client's pings with pongs automatically (an idle but
+// healthy peer). With serverReads=false the server swallows bytes at the TCP
+// level without WebSocket-level processing, so pings are never answered —
+// emulating a stalled/half-open peer while keeping the TCP connection open.
+// The returned WSConnection is configured with the supplied read deadline
+// interval; the caller must close srv to release the goroutine.
+func newTestWSConn(t *testing.T, readDeadlineInterval time.Duration, serverReads bool) (*WSConnection, *httptest.Server) {
 	t.Helper()
 
 	upgrader := websocket.Upgrader{
@@ -42,10 +46,20 @@ func newTestWSConn(t *testing.T, readDeadlineInterval time.Duration) (*WSConnect
 			return
 		}
 		defer c.Close()
-		// Hold the connection without sending anything so the client side
-		// blocks on Read until either the deadline fires or we close.
+		if serverReads {
+			// Hold the connection without sending anything so the client
+			// side blocks on Read; pings are auto-answered with pongs.
+			for {
+				if _, _, err := c.ReadMessage(); err != nil {
+					return
+				}
+			}
+		}
+		// Stalled peer: consume raw bytes so the TCP connection stays
+		// open but no pong (or any frame) is ever sent back.
+		buf := make([]byte, 1024)
 		for {
-			if _, _, err := c.ReadMessage(); err != nil {
+			if _, err := c.UnderlyingConn().Read(buf); err != nil {
 				return
 			}
 		}
@@ -69,12 +83,13 @@ func newTestWSConn(t *testing.T, readDeadlineInterval time.Duration) (*WSConnect
 	return conn, srv
 }
 
-// TestHandleMessageReadDeadlineFiresWithinInterval verifies the S1 fix:
-// when readDeadlineInterval is set, handleMessage exits within roughly that
-// interval even though the peer never sends anything. Without the fix the
-// goroutine would block until kernel TCP retransmission timeout (~15min).
+// TestHandleMessageReadDeadlineFiresWithinInterval verifies the half-open
+// detection: when readDeadlineInterval is set and the peer stops answering
+// entirely (not even pongs), handleMessage exits within roughly that
+// interval. Without the fix the goroutine would block until kernel TCP
+// retransmission timeout (~15min).
 func TestHandleMessageReadDeadlineFiresWithinInterval(t *testing.T) {
-	conn, srv := newTestWSConn(t, 100*time.Millisecond)
+	conn, srv := newTestWSConn(t, 100*time.Millisecond, false)
 	defer srv.Close()
 
 	done := make(chan struct{})
@@ -100,7 +115,7 @@ func TestHandleMessageReadDeadlineFiresWithinInterval(t *testing.T) {
 // TestHandleMessageZeroReadDeadlineKeepsLegacyBehavior verifies that the
 // existing zero-value behavior (no deadline = block forever) is preserved.
 func TestHandleMessageZeroReadDeadlineKeepsLegacyBehavior(t *testing.T) {
-	conn, srv := newTestWSConn(t, 0)
+	conn, srv := newTestWSConn(t, 0, true)
 	defer srv.Close()
 
 	done := make(chan struct{})
@@ -121,12 +136,47 @@ func TestHandleMessageZeroReadDeadlineKeepsLegacyBehavior(t *testing.T) {
 	<-done
 }
 
+// TestHandleMessagePingKeepsIdleConnectionAlive verifies that an idle but
+// healthy connection is NOT torn down by the read deadline: pingLoop keeps
+// sending pings, the peer answers with pongs, and each pong extends the
+// deadline. Only after the peer stops answering does the deadline fire.
+func TestHandleMessagePingKeepsIdleConnectionAlive(t *testing.T) {
+	interval := 300 * time.Millisecond
+	conn, srv := newTestWSConn(t, interval, true)
+	defer srv.Close()
+
+	done := make(chan struct{})
+	go func() {
+		conn.handleMessage()
+		close(done)
+	}()
+
+	// Idle for several intervals: without pong-driven deadline extension
+	// handleMessage would exit within ~interval.
+	select {
+	case <-done:
+		t.Fatal("handleMessage exited on an idle but healthy connection; pings/pongs did not extend the deadline")
+	case <-time.After(3 * interval):
+		// expected: still alive
+	}
+
+	// Cleanup: close the conn to unblock handleMessage. (Deadline expiry on
+	// a stalled peer is covered by
+	// TestHandleMessageReadDeadlineFiresWithinInterval.)
+	_ = conn.wsConn.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleMessage did not return after the connection was closed")
+	}
+}
+
 // TestSetReadDeadlinePropagatesToWSConn verifies the SetReadDeadline bug
 // fix: the call must reach gorilla/websocket's underlying conn. We trigger
 // this by setting a past deadline and observing that the next read errors
 // out immediately.
 func TestSetReadDeadlinePropagatesToWSConn(t *testing.T) {
-	conn, srv := newTestWSConn(t, 0)
+	conn, srv := newTestWSConn(t, 0, true)
 	defer srv.Close()
 	// Close the client conn explicitly so the server-side handler goroutine
 	// (looping on ReadMessage) exits even if srv.Close alone does not

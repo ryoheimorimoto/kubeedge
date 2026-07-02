@@ -101,9 +101,49 @@ func (conn *WSConnection) handleRawData() {
 	}
 }
 
-func (conn *WSConnection) handleMessage() {
+// pingLoop keeps guaranteed inbound traffic flowing on an otherwise idle
+// connection by sending WebSocket protocol pings every half of
+// readDeadlineInterval. The pongs sent back by the peer (gorilla answers
+// pings automatically as long as its read loop is running) reset the read
+// deadline via the pong handler registered in handleMessage, so the deadline
+// only expires when the connection is genuinely stalled.
+func (conn *WSConnection) pingLoop(stop <-chan struct{}) {
+	period := conn.readDeadlineInterval / 2
+	ticker := time.NewTicker(period)
+	defer ticker.Stop()
 	for {
-		// Apply a per-iteration read deadline so a half-open TCP connection
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			// WriteControl is safe for concurrent use with the data-plane
+			// writes going through conn.locker.
+			if err := conn.wsConn.WriteControl(websocket.PingMessage, nil, time.Now().Add(period)); err != nil {
+				// The read side will surface the failure via the read
+				// deadline; just stop pinging.
+				return
+			}
+		}
+	}
+}
+
+func (conn *WSConnection) handleMessage() {
+	if conn.readDeadlineInterval > 0 {
+		// A read deadline alone would tear down idle-but-healthy
+		// connections: nothing guarantees cloud-to-edge traffic within the
+		// interval (EdgeHub's keepalive is one-way; CloudHub sends no
+		// response to it). pingLoop provides that guarantee at the
+		// WebSocket protocol level, and every pong extends the deadline
+		// here, so expiry now means the peer stopped answering entirely.
+		conn.wsConn.SetPongHandler(func(string) error {
+			return conn.wsConn.SetReadDeadline(time.Now().Add(conn.readDeadlineInterval))
+		})
+		stopPing := make(chan struct{})
+		defer close(stopPing)
+		go conn.pingLoop(stopPing)
+	}
+	for {
+		// Arm/refresh the read deadline so a half-open TCP connection
 		// surfaces as a read error within readDeadlineInterval instead of
 		// waiting for kernel TCP retransmission (tcp_retries2, ~15min on Linux).
 		if conn.readDeadlineInterval > 0 {
@@ -112,10 +152,12 @@ func (conn *WSConnection) handleMessage() {
 		msg := &model.Message{}
 		err := lane.NewLane(api.ProtocolTypeWS, conn.wsConn).ReadMessage(msg)
 		if err != nil {
-			// A read deadline expiry is the expected reconnect path when
-			// readDeadlineInterval is set, so log it at a low verbosity to
-			// avoid spamming Errorf on every (60s by default) reconnect cycle.
-			// Genuine transport errors still surface as Errorf.
+			// With pingLoop keeping pongs flowing, a deadline expiry means
+			// no inbound traffic at all for readDeadlineInterval: the
+			// connection is treated as half-open. This is the designed
+			// detection path, so keep it quiet; EdgeHub already logs the
+			// resulting reconnect at Warning level. Genuine transport
+			// errors still surface as Errorf.
 			var netErr net.Error
 			switch {
 			case errors.Is(err, io.EOF):
