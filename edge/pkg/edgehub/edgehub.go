@@ -73,11 +73,12 @@ func newEdgeHub(enable bool) *EdgeHub {
 		// channel; coalescing them is intentional.
 		reconnectChan: make(chan struct{}, 1),
 		// rotateChan carries certificate-rotation signals separately from
-		// reconnectChan. A rotation must always be followed by a reconnect
-		// so that chClient.Init() reloads the new certificate from disk;
-		// unlike transport reconnect signals, a rotation signal is never
-		// discarded by a drain — it is only consumed by the reconnect wait
-		// in Start.
+		// reconnectChan. A rotation must always be followed by a (re)connect
+		// that loads the new certificate from disk: while connected, a
+		// rotation signal is never discarded (the post-connect drain only
+		// touches reconnectChan) and is consumed by the reconnect wait in
+		// Start; a stale signal is dropped only while disconnected, right
+		// before an Init() that reads the newest certificate anyway.
 		rotateChan: make(chan struct{}, 1),
 		rateLimiter: flowcontrol.NewTokenBucketRateLimiter(
 			float32(config.Config.EdgeHub.MessageQPS),
@@ -209,13 +210,14 @@ func (eh *EdgeHub) Start() {
 
 		// wait the stop signal
 		// stop authinfo manager/websocket connection
+		rotated := false
 		select {
 		case <-eh.reconnectChan:
 		case <-eh.rotateChan:
 			// The certificate was rotated (possibly while the connect above
 			// was in flight). Re-establish the connection so chClient.Init()
 			// reloads the new certificate from disk.
-			klog.Info("certificate rotated, reconnecting to reload it")
+			rotated = true
 		}
 		eh.chClient.UnInit()
 
@@ -229,7 +231,13 @@ func (eh *EdgeHub) Start() {
 			backoff = reconnectBackoff()
 		}
 		sleep := backoff.Step()
-		klog.Warningf("connection is broken, will reconnect after %s", sleep.String())
+		if rotated {
+			// Intentional disconnect: not a transport failure, so do not
+			// alarm operators with a broken-connection warning.
+			klog.Infof("certificate rotated, will reconnect after %s to reload it", sleep.String())
+		} else {
+			klog.Warningf("connection is broken, will reconnect after %s", sleep.String())
+		}
 		time.Sleep(sleep)
 
 		// reconnectChan is buffered(1) and triggerReconnect is non-blocking,
