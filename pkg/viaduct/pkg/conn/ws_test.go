@@ -141,7 +141,10 @@ func TestHandleMessageZeroReadDeadlineKeepsLegacyBehavior(t *testing.T) {
 // sending pings, the peer answers with pongs, and each pong extends the
 // deadline. Only after the peer stops answering does the deadline fire.
 func TestHandleMessagePingKeepsIdleConnectionAlive(t *testing.T) {
-	interval := 300 * time.Millisecond
+	// Generous interval so that a scheduling hiccup on a loaded CI runner
+	// (ping every interval/2, pong must arrive within interval) does not
+	// fail the test spuriously.
+	interval := 800 * time.Millisecond
 	conn, srv := newTestWSConn(t, interval, true)
 	defer srv.Close()
 

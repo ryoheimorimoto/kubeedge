@@ -119,8 +119,17 @@ func (conn *WSConnection) pingLoop(stop <-chan struct{}) {
 			// WriteControl is safe for concurrent use with the data-plane
 			// writes going through conn.locker.
 			if err := conn.wsConn.WriteControl(websocket.PingMessage, nil, time.Now().Add(period)); err != nil {
-				// The read side will surface the failure via the read
-				// deadline; just stop pinging.
+				var netErr net.Error
+				if errors.As(err, &netErr) && netErr.Timeout() {
+					// The write lock was held past the deadline (e.g. a
+					// large message on a slow link); the connection may
+					// well be healthy. Keep pinging — liveness is judged
+					// by the read deadline, not here.
+					continue
+				}
+				// The connection is gone (closed or broken); the read side
+				// surfaces the failure via the read deadline.
+				klog.V(2).Infof("ping loop stopped: %v", err)
 				return
 			}
 		}
