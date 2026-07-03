@@ -31,9 +31,10 @@ func reconnectBackoff() wait.Backoff {
 		Factor:   2.0,
 		Jitter:   0.2,
 		Cap:      30 * time.Second,
-		// Steps is effectively unbounded; once Cap is reached, Step()
-		// keeps returning a jittered value in [Cap, Cap*(1+Jitter)).
-		// We never want to stop retrying.
+		// Steps only bounds how many times Duration may grow — it never
+		// stops Step() from returning values: once Cap is reached, Step()
+		// keeps returning a jittered value in [Cap, Cap*(1+Jitter))
+		// indefinitely. MaxInt32 just ensures growth is never cut short.
 		Steps: math.MaxInt32,
 	}
 }
