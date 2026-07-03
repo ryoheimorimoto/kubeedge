@@ -32,7 +32,8 @@ func reconnectBackoff() wait.Backoff {
 		Jitter:   0.2,
 		Cap:      30 * time.Second,
 		// Steps is effectively unbounded; once Cap is reached, Step()
-		// keeps returning Cap*(1+jitter). We never want to stop retrying.
+		// keeps returning a jittered value in [Cap, Cap*(1+Jitter)).
+		// We never want to stop retrying.
 		Steps: math.MaxInt32,
 	}
 }
@@ -75,7 +76,8 @@ func newEdgeHub(enable bool) *EdgeHub {
 		// reconnectChan. A rotation must always be followed by a reconnect
 		// so that chClient.Init() reloads the new certificate from disk;
 		// unlike transport reconnect signals, a rotation signal is never
-		// drained away (see Start).
+		// discarded by a drain — it is only consumed by the reconnect wait
+		// in Start.
 		rotateChan: make(chan struct{}, 1),
 		rateLimiter: flowcontrol.NewTokenBucketRateLimiter(
 			float32(config.Config.EdgeHub.MessageQPS),
