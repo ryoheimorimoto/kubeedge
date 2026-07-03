@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/kubeedge/api/apis/componentconfig/edgecore/v1alpha2"
+	"github.com/kubeedge/kubeedge/edge/pkg/edgehub/certificate"
 	"github.com/kubeedge/kubeedge/edge/pkg/edgehub/config"
 )
 
@@ -118,6 +119,39 @@ func TestTriggerReconnectNonBlocking(t *testing.T) {
 	select {
 	case <-eh.reconnectChan:
 		t.Fatal("did not expect a second reconnect signal")
+	default:
+	}
+}
+
+// TestIfRotationDoneSendsToRotateChan guards the wiring that makes the
+// rotation guarantee hold end-to-end: a certManager.Done signal must be
+// forwarded to rotateChan — never to the drainable reconnectChan, where the
+// post-connect drain could discard it.
+func TestIfRotationDoneSendsToRotateChan(t *testing.T) {
+	eh := &EdgeHub{
+		reconnectChan: make(chan struct{}, 1),
+		rotateChan:    make(chan struct{}, 1),
+		certManager: certificate.CertManager{
+			RotateCertificates: true,
+			Done:               make(chan struct{}),
+		},
+	}
+	go eh.ifRotationDone()
+
+	select {
+	case eh.certManager.Done <- struct{}{}:
+	case <-time.After(time.Second):
+		t.Fatal("ifRotationDone did not consume certManager.Done")
+	}
+
+	select {
+	case <-eh.rotateChan:
+	case <-time.After(time.Second):
+		t.Fatal("rotation signal was not forwarded to rotateChan")
+	}
+	select {
+	case <-eh.reconnectChan:
+		t.Fatal("rotation signal must not go to reconnectChan")
 	default:
 	}
 }
