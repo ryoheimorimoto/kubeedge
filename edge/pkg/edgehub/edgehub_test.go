@@ -211,8 +211,9 @@ func TestShouldResetBackoff(t *testing.T) {
 
 func TestReconnectBackoffGrowsAndCaps(t *testing.T) {
 	b := reconnectBackoff()
-	cap := 30 * time.Second
-	maxAllowed := cap + (cap * 20 / 100)
+	// Derive bounds from the Backoff contract itself so the test keeps
+	// holding when the constants are tuned.
+	maxAllowed := b.Cap + time.Duration(float64(b.Cap)*b.Jitter)
 
 	for i := 0; i < 50; i++ {
 		got := b.Step()
@@ -231,12 +232,14 @@ func TestReconnectBackoffResetReturnsInitial(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		b.Step()
 	}
-	// Re-creating returns a backoff starting from the initial duration
-	// (2s); this is the contract used to reset on successful reconnect.
+	// Re-creating returns a backoff starting from the initial duration;
+	// this is the contract used to reset after a healthy connection.
+	// Bounds derive from the Backoff fields (captured before Step mutates
+	// Duration) so the test keeps holding when the constants are tuned.
 	b2 := reconnectBackoff()
+	minAllowed := b2.Duration
+	maxAllowed := b2.Duration + time.Duration(float64(b2.Duration)*b2.Jitter)
 	first := b2.Step()
-	minAllowed := 2 * time.Second
-	maxAllowed := 2*time.Second + (2*time.Second*20)/100
 	if first < minAllowed || first > maxAllowed {
 		t.Fatalf("initial step out of [%v, %v]: got %v", minAllowed, maxAllowed, first)
 	}

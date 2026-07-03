@@ -175,6 +175,17 @@ func (eh *EdgeHub) Start() {
 			return
 		}
 
+		// A rotation that completed while we were disconnected is already
+		// satisfied by the upcoming Init(), which reads the newest
+		// certificate from disk (certManager writes the files before
+		// signaling). Discard such a stale signal now — while still
+		// disconnected — so it does not trigger a redundant reconnect right
+		// after the connection is established. A rotation completing after
+		// this point sends a fresh signal that survives to the wait below.
+		select {
+		case <-eh.rotateChan:
+		default:
+		}
 		err = eh.chClient.Init()
 		if err != nil {
 			sleep := backoff.Step()
