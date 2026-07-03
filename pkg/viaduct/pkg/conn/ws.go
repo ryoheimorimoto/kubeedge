@@ -109,6 +109,12 @@ func (conn *WSConnection) handleRawData() {
 // only expires when the connection is genuinely stalled.
 func (conn *WSConnection) pingLoop(stop <-chan struct{}) {
 	period := conn.readDeadlineInterval / 2
+	if period <= 0 {
+		// In-repo configuration is int32 seconds (>= 1s), but the field
+		// takes a raw Duration: guard the integer division against sub-2ns
+		// values so NewTicker cannot panic.
+		period = time.Millisecond
+	}
 	ticker := time.NewTicker(period)
 	defer ticker.Stop()
 	for {
