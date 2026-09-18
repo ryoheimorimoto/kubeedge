@@ -330,11 +330,13 @@ func (conn *QuicConnection) ReadMessage(msg *model.Message) error {
 	return conn.messageFifo.Get(msg)
 }
 
-// SetReadDeadline stores the deadline without arming one on the streams, and
-// nothing reads it back. A stream deadline would be wrong here: stream reads
-// see no data on an idle-but-healthy session, because QUIC keepalive travels
-// at session level, so it would tear down healthy connections. A half-open
-// path surfaces through the session idle timeout of the transport instead.
+// SetReadDeadline is not implemented for QUIC: the deadline is recorded but
+// never applied to a read, so a caller asking for pending reads to time out
+// does not get that yet. Separately, the transport does not use stream read
+// deadlines for liveness (the WebSocket transport does): stream reads see no
+// data on an idle-but-healthy session, because QUIC keepalive travels at
+// session level, so a half-open path surfaces through the session idle
+// timeout of the transport instead.
 func (conn *QuicConnection) SetReadDeadline(t time.Time) error {
 	conn.readDeadline = t
 	return nil
