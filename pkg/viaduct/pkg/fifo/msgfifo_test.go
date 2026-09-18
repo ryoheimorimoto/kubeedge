@@ -173,9 +173,12 @@ func TestMessageFifo_Close_ConcurrentWithPut(t *testing.T) {
 // both the message and the close are then ready, so Get has to prefer the
 // message rather than letting the select pick at random.
 func TestMessageFifo_Close_DrainsMessageDeliveredAtClose(t *testing.T) {
-	// The window is between the drain attempt and the blocking select, so the
-	// reader is started without a delay and the interleaving is hunted by
-	// repetition rather than by sleeping.
+	// The window is between the reader's drain attempt and its blocking
+	// select: when Put and Close both complete inside it, the select sees
+	// both cases ready. The reader is started without a delay so it is often
+	// still in that window, and the interleaving is hunted by repetition
+	// rather than by sleeping; against a Get without the recheck this fails
+	// on every run within a few thousand iterations.
 	for i := 0; i < 100000; i++ {
 		f := NewMessageFifo()
 
@@ -195,53 +198,74 @@ func TestMessageFifo_Close_DrainsMessageDeliveredAtClose(t *testing.T) {
 	}
 }
 
-// TestMessageFifo_Put_ReturnsAfterCloseWhenSlotIsStolen guards the overflow
-// path against a closed fifo. After Close no consumer drains the buffer, and a
-// producer that drops the oldest message can lose the freed slot to another
-// producer (one per QUIC stream); its second send would then block forever
-// and leak the stream's read goroutine. A refiller that keeps the buffer full
-// makes that interleaving reliable.
-func TestMessageFifo_Put_ReturnsAfterCloseWhenSlotIsStolen(t *testing.T) {
+// TestMessageFifo_Put_DropsAfterClose covers the fast path: once the fifo is
+// closed, a Put must not enqueue even if there is capacity, otherwise a Get
+// can deliver a post-close message instead of the close error.
+func TestMessageFifo_Put_DropsAfterClose(t *testing.T) {
 	f := NewMessageFifo()
-	for i := 0; i < comm.MessageFiFoSizeMax; i++ {
-		f.Put(&model.Message{Header: model.MessageHeader{ID: "fill"}})
-	}
 	f.Close()
 
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() { // steals every slot the producers free
-		filler := model.Message{Header: model.MessageHeader{ID: "stolen"}}
-		for {
-			select {
-			case <-stop:
-				return
-			case f.fifo <- filler:
-			default:
-			}
-		}
-	}()
+	for i := 0; i < 100; i++ {
+		f.Put(&model.Message{Header: model.MessageHeader{ID: "late"}})
+	}
 
-	var wg sync.WaitGroup
-	for p := 0; p < 4; p++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 500; j++ {
-				f.Put(&model.Message{Header: model.MessageHeader{ID: "late"}})
+	var msg model.Message
+	assert.Error(t, f.Get(&msg))
+	assert.Equal(t, 0, len(f.fifo))
+}
+
+// TestMessageFifo_Put_ReturnsWhenClosedDuringOverflow guards the overflow path
+// against a close that lands while producers are already inside it. After the
+// close nothing drains the buffer, and a producer that dropped the oldest
+// message can lose the freed slot to another producer (one per QUIC stream);
+// its second send would then block forever and leak the stream's read
+// goroutine. Producers are churning through the overflow path when Close
+// happens, and a refiller keeps the buffer full from then on so the lost-slot
+// interleaving is reliable.
+func TestMessageFifo_Put_ReturnsWhenClosedDuringOverflow(t *testing.T) {
+	for round := 0; round < 50; round++ {
+		f := NewMessageFifo()
+		for i := 0; i < comm.MessageFiFoSizeMax; i++ {
+			f.Put(&model.Message{Header: model.MessageHeader{ID: "fill"}})
+		}
+
+		var wg sync.WaitGroup
+		for p := 0; p < 4; p++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := 0; j < 500; j++ {
+					f.Put(&model.Message{Header: model.MessageHeader{ID: "late"}})
+				}
+			}()
+		}
+		time.Sleep(time.Millisecond) // let the producers reach the overflow path
+
+		stop := make(chan struct{})
+		go func() { // steals every slot the producers free from now on
+			filler := model.Message{Header: model.MessageHeader{ID: "stolen"}}
+			for {
+				select {
+				case <-stop:
+					return
+				case f.fifo <- filler:
+				default:
+				}
 			}
 		}()
-	}
-	finished := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(finished)
-	}()
+		f.Close()
 
-	select {
-	case <-finished:
-	case <-time.After(3 * time.Second):
-		t.Fatal("a producer is still blocked in Put after Close")
+		finished := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(finished)
+		}()
+		select {
+		case <-finished:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("round %d: a producer is still blocked in Put after Close", round)
+		}
+		close(stop)
 	}
 }
 

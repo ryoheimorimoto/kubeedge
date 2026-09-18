@@ -26,11 +26,19 @@ func NewMessageFifo() *MessageFifo {
 
 // Put put the message into fifo
 func (f *MessageFifo) Put(msg *model.Message) {
+	// Checked on its own first: in a select with the send, a closed fifo
+	// that still has capacity would let the send win at random.
+	select {
+	case <-f.done:
+		// The connection is torn down and nothing will read this.
+		return
+	default:
+	}
+
 	select {
 	case f.fifo <- *msg:
 		return
 	case <-f.done:
-		// The connection is torn down and nothing will read this.
 		return
 	default:
 	}
