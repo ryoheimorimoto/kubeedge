@@ -17,6 +17,7 @@ limitations under the License.
 package fifo
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -102,10 +103,6 @@ func TestMessageFifo_Close(t *testing.T) {
 	f := NewMessageFifo()
 	f.Close()
 
-	// Verify channel is closed
-	_, ok := <-f.fifo
-	assert.False(t, ok)
-
 	// Verify Get returns error on closed fifo
 	var msg model.Message
 	err := f.Get(&msg)
@@ -116,6 +113,73 @@ func TestMessageFifo_Close(t *testing.T) {
 	assert.NotPanics(t, func() {
 		f.Close()
 	})
+}
+
+// TestMessageFifo_Close_ReleasesBlockedGet covers the reason Close exists: a
+// caller already parked in Get has to be released, otherwise the reader of a
+// torn-down connection never returns.
+func TestMessageFifo_Close_ReleasesBlockedGet(t *testing.T) {
+	f := NewMessageFifo()
+
+	released := make(chan error, 1)
+	go func() {
+		var msg model.Message
+		released <- f.Get(&msg)
+	}()
+
+	select {
+	case <-released:
+		t.Fatal("Get returned before Close")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	f.Close()
+
+	select {
+	case err := <-released:
+		assert.Error(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Get is still blocked after Close")
+	}
+}
+
+// TestMessageFifo_Close_ConcurrentWithPut guards against closing the message
+// channel: Put runs on a connection read loop while Close runs on the
+// reconnect path, so a Close that closed the channel would panic with "send on
+// closed channel" when the two overlap.
+func TestMessageFifo_Close_ConcurrentWithPut(t *testing.T) {
+	assert.NotPanics(t, func() {
+		for i := 0; i < 100; i++ {
+			f := NewMessageFifo()
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				for j := 0; j < 50; j++ {
+					f.Put(&model.Message{Header: model.MessageHeader{ID: "concurrent"}})
+				}
+			}()
+			go func() {
+				defer wg.Done()
+				f.Close()
+			}()
+			wg.Wait()
+		}
+	})
+}
+
+// TestMessageFifo_Close_DrainsBufferedMessages documents that a close does not
+// discard messages that were already delivered into the fifo.
+func TestMessageFifo_Close_DrainsBufferedMessages(t *testing.T) {
+	f := NewMessageFifo()
+	f.Put(&model.Message{Header: model.MessageHeader{ID: "buffered"}})
+	f.Close()
+
+	var msg model.Message
+	assert.NoError(t, f.Get(&msg))
+	assert.Equal(t, "buffered", msg.Header.ID)
+
+	assert.Error(t, f.Get(&msg))
 }
 
 func TestMessageFifo_Get_Blocking(t *testing.T) {

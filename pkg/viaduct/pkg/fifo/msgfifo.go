@@ -12,6 +12,7 @@ import (
 
 type MessageFifo struct {
 	fifo      chan model.Message
+	done      chan struct{}
 	closeOnce sync.Once
 }
 
@@ -19,6 +20,7 @@ type MessageFifo struct {
 func NewMessageFifo() *MessageFifo {
 	return &MessageFifo{
 		fifo: make(chan model.Message, comm.MessageFiFoSizeMax),
+		done: make(chan struct{}),
 	}
 }
 
@@ -38,16 +40,28 @@ func (f *MessageFifo) Put(msg *model.Message) {
 // Get get message from fifo
 // this api is blocked when the fifo is empty
 func (f *MessageFifo) Get(msg *model.Message) error {
-	var ok bool
-	*msg, ok = <-f.fifo
-	if !ok {
+	// Drain what is already buffered before reporting the close, so a
+	// teardown does not discard messages that arrived before it.
+	select {
+	case *msg = <-f.fifo:
+		return nil
+	default:
+	}
+
+	select {
+	case *msg = <-f.fifo:
+		return nil
+	case <-f.done:
 		return fmt.Errorf("the fifo is broken")
 	}
-	return nil
 }
 
+// Close releases the callers blocked in Get. It deliberately leaves the
+// message channel open: Put runs on the connection's read loop, so closing
+// the channel here would panic with "send on closed channel" whenever a
+// message arrives while the connection is being torn down.
 func (f *MessageFifo) Close() {
 	f.closeOnce.Do(func() {
-		close(f.fifo)
+		close(f.done)
 	})
 }
