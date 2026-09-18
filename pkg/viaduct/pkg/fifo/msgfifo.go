@@ -52,6 +52,13 @@ func (f *MessageFifo) Put(msg *model.Message) {
 	case <-f.fifo:
 	default:
 	}
+	// Same as above: a close that landed during the drop would otherwise
+	// leave the send and the done case both ready.
+	select {
+	case <-f.done:
+		return
+	default:
+	}
 	select {
 	case f.fifo <- *msg:
 		klog.Warning("too many message received, fifo overflow")
