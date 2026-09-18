@@ -168,6 +168,33 @@ func TestMessageFifo_Close_ConcurrentWithPut(t *testing.T) {
 	})
 }
 
+// TestMessageFifo_Close_DrainsMessageDeliveredAtClose covers the interleaving
+// where a message lands while the close happens and a Get is already parked:
+// both the message and the close are then ready, so Get has to prefer the
+// message rather than letting the select pick at random.
+func TestMessageFifo_Close_DrainsMessageDeliveredAtClose(t *testing.T) {
+	// The window is between the drain attempt and the blocking select, so the
+	// reader is started without a delay and the interleaving is hunted by
+	// repetition rather than by sleeping.
+	for i := 0; i < 100000; i++ {
+		f := NewMessageFifo()
+
+		got := make(chan error, 1)
+		var received model.Message
+		go func() {
+			got <- f.Get(&received)
+		}()
+
+		f.Put(&model.Message{Header: model.MessageHeader{ID: "at-close"}})
+		f.Close()
+
+		if err := <-got; err != nil {
+			t.Fatalf("iteration %d: Get reported the close and dropped a message that arrived before it: %v", i, err)
+		}
+		assert.Equal(t, "at-close", received.Header.ID)
+	}
+}
+
 // TestMessageFifo_Close_DrainsBufferedMessages documents that a close does not
 // discard messages that were already delivered into the fifo.
 func TestMessageFifo_Close_DrainsBufferedMessages(t *testing.T) {

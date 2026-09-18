@@ -279,13 +279,18 @@ func TestUnInitReleasesBlockedReceive(t *testing.T) {
 	}
 
 	received := make(chan error, 1)
-	started := make(chan struct{})
 	go func() {
-		close(started)
 		_, err := qc.Receive()
 		received <- err
 	}()
-	<-started
+
+	// Confirm the reader is parked, so the test cannot pass with a teardown
+	// that only makes later reads fail.
+	select {
+	case err := <-received:
+		t.Fatalf("Receive() returned before UnInit, err: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
 
 	qc.UnInit()
 

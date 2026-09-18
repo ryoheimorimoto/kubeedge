@@ -70,13 +70,18 @@ func TestCloseReleasesBlockedReadMessage(t *testing.T) {
 	conn := newTestQuicConn(t)
 
 	blocked := make(chan error, 1)
-	started := make(chan struct{})
 	go func() {
 		msg := &model.Message{}
-		close(started)
 		blocked <- conn.ReadMessage(msg)
 	}()
-	<-started
+
+	// Confirm the reader is parked, so the test cannot pass with a Close
+	// that only makes later reads fail.
+	select {
+	case err := <-blocked:
+		t.Fatalf("ReadMessage returned before Close: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
 
 	if err := conn.Close(); err != nil {
 		t.Fatalf("Close: %v", err)

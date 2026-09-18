@@ -52,7 +52,15 @@ func (f *MessageFifo) Get(msg *model.Message) error {
 	case *msg = <-f.fifo:
 		return nil
 	case <-f.done:
-		return fmt.Errorf("the fifo is broken")
+		// A message can be delivered just as the close happens, which makes
+		// both cases ready; the select then picks at random, so check the
+		// buffer once more before reporting the close.
+		select {
+		case *msg = <-f.fifo:
+			return nil
+		default:
+			return fmt.Errorf("the fifo is broken")
+		}
 	}
 }
 
