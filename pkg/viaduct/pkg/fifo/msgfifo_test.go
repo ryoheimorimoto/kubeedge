@@ -17,11 +17,14 @@ limitations under the License.
 package fifo
 
 import (
+	"io"
+	"os"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"k8s.io/klog/v2"
 
 	"github.com/kubeedge/beehive/pkg/core/model"
 	"github.com/kubeedge/kubeedge/pkg/viaduct/pkg/comm"
@@ -223,6 +226,16 @@ func TestMessageFifo_Put_DropsAfterClose(t *testing.T) {
 // happens, and a refiller keeps the buffer full from then on so the lost-slot
 // interleaving is reliable.
 func TestMessageFifo_Put_ReturnsWhenClosedDuringOverflow(t *testing.T) {
+	// Every overflow logs a warning and this test overflows tens of
+	// thousands of times, which would bury the rest of the -v output.
+	klog.LogToStderr(false)
+	klog.SetOutput(io.Discard)
+	t.Cleanup(func() {
+		klog.Flush()
+		klog.SetOutput(os.Stderr)
+		klog.LogToStderr(true)
+	})
+
 	for round := 0; round < 50; round++ {
 		f := NewMessageFifo()
 		for i := 0; i < comm.MessageFiFoSizeMax; i++ {
