@@ -257,6 +257,11 @@ func (conn *QuicConnection) handleMessage(stream *smgr.Stream) {
 // close the session
 func (conn *QuicConnection) Close() error {
 	conn.state.State = api.StatDisconnected
+	// Release readers parked in ReadMessage: messageFifo.Get blocks on an
+	// open channel, so without this a reader of a torn-down connection
+	// (EdgeHub's routeToEdge) never returns and its goroutine leaks once
+	// per reconnect.
+	conn.messageFifo.Close()
 	conn.streamManager.Destroy()
 	return conn.session.Close()
 }
@@ -325,6 +330,11 @@ func (conn *QuicConnection) ReadMessage(msg *model.Message) error {
 	return conn.messageFifo.Get(msg)
 }
 
+// SetReadDeadline stores the deadline without arming one on the streams, and
+// nothing reads it back. A stream deadline would be wrong here: stream reads
+// see no data on an idle-but-healthy session, because QUIC keepalive travels
+// at session level, so it would tear down healthy connections. A half-open
+// path surfaces through the session idle timeout of the transport instead.
 func (conn *QuicConnection) SetReadDeadline(t time.Time) error {
 	conn.readDeadline = t
 	return nil
