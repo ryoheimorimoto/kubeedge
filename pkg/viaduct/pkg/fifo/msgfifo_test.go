@@ -195,6 +195,56 @@ func TestMessageFifo_Close_DrainsMessageDeliveredAtClose(t *testing.T) {
 	}
 }
 
+// TestMessageFifo_Put_ReturnsAfterCloseWhenSlotIsStolen guards the overflow
+// path against a closed fifo. After Close no consumer drains the buffer, and a
+// producer that drops the oldest message can lose the freed slot to another
+// producer (one per QUIC stream); its second send would then block forever
+// and leak the stream's read goroutine. A refiller that keeps the buffer full
+// makes that interleaving reliable.
+func TestMessageFifo_Put_ReturnsAfterCloseWhenSlotIsStolen(t *testing.T) {
+	f := NewMessageFifo()
+	for i := 0; i < comm.MessageFiFoSizeMax; i++ {
+		f.Put(&model.Message{Header: model.MessageHeader{ID: "fill"}})
+	}
+	f.Close()
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() { // steals every slot the producers free
+		filler := model.Message{Header: model.MessageHeader{ID: "stolen"}}
+		for {
+			select {
+			case <-stop:
+				return
+			case f.fifo <- filler:
+			default:
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for p := 0; p < 4; p++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				f.Put(&model.Message{Header: model.MessageHeader{ID: "late"}})
+			}
+		}()
+	}
+	finished := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(finished)
+	}()
+
+	select {
+	case <-finished:
+	case <-time.After(3 * time.Second):
+		t.Fatal("a producer is still blocked in Put after Close")
+	}
+}
+
 // TestMessageFifo_Close_DrainsBufferedMessages documents that a close does not
 // discard messages that were already delivered into the fifo.
 func TestMessageFifo_Close_DrainsBufferedMessages(t *testing.T) {

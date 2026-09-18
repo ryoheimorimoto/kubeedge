@@ -28,12 +28,26 @@ func NewMessageFifo() *MessageFifo {
 func (f *MessageFifo) Put(msg *model.Message) {
 	select {
 	case f.fifo <- *msg:
+		return
+	case <-f.done:
+		// The connection is torn down and nothing will read this.
+		return
 	default:
-		// discard the old message
-		<-f.fifo
-		// push into fifo
-		f.fifo <- *msg
+	}
+
+	// The fifo is full: discard the oldest message, then queue this one.
+	// Both steps have to give up on a closed fifo, because after the close
+	// no consumer drains it and several producers (one per QUIC stream) can
+	// race for the freed slot; a producer blocked here would leak its
+	// stream's read goroutine.
+	select {
+	case <-f.fifo:
+	default:
+	}
+	select {
+	case f.fifo <- *msg:
 		klog.Warning("too many message received, fifo overflow")
+	case <-f.done:
 	}
 }
 
